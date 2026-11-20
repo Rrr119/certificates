@@ -123,6 +123,14 @@ type ACME struct {
 	// provisioner. If this value is not set the default apple, step and tpm
 	// will be used.
 	AttestationFormats []ACMEAttestationFormat `json:"attestationFormats,omitempty"`
+	// Policy contains ACME specific issuance restrictions, like the allowed
+	// identifier types and whether wildcard names are permitted. If not set,
+	// all identifier types and wildcard names are allowed.
+	Policy *ACMEPolicy `json:"policy,omitempty"`
+	// Quota limits the number of active certificates this provisioner can
+	// have at any point in time. Certificates that expire or are revoked
+	// free up their slot. If not set, no quota is enforced.
+	Quota *Quota `json:"quota,omitempty"`
 	// AttestationRoots contains a bundle of root certificates in PEM format
 	// that will be used to verify the attestation certificates. If provided,
 	// this bundle will be used even for well-known CAs like Apple and Yubico.
@@ -197,6 +205,23 @@ func (p *ACME) GetOptions() *Options {
 	return p.Options
 }
 
+// GetQuota returns the configured provisioner quota.
+func (p *ACME) GetQuota() *Quota {
+	return p.Quota
+}
+
+// AcquireQuota reserves a slot in the provisioner's issuance quota. It
+// implements [QuotaLimiter].
+func (p *ACME) AcquireQuota(ctx context.Context) (*QuotaReservation, error) {
+	return p.ctl.AcquireQuota(ctx)
+}
+
+// ReleaseQuota frees the quota slot held by the certificate with the given
+// (decimal) serial number. It implements [QuotaLimiter].
+func (p *ACME) ReleaseQuota(serialNumber string) {
+	p.ctl.ReleaseQuota(serialNumber)
+}
+
 // DefaultTLSCertDuration returns the default TLS cert duration enforced by
 // the provisioner.
 func (p *ACME) DefaultTLSCertDuration() time.Duration {
@@ -221,6 +246,14 @@ func (p *ACME) Init(config Config) (err error) {
 		if err := f.Validate(); err != nil {
 			return err
 		}
+	}
+
+	if err := p.Policy.Validate(); err != nil {
+		return err
+	}
+
+	if err := p.Quota.Validate(); err != nil {
+		return err
 	}
 
 	// Parse attestation roots.
@@ -389,9 +422,65 @@ type ACMEIdentifier struct {
 	Value string
 }
 
+// ACMEPolicy defines ACME specific issuance restrictions for a provisioner.
+// It is evaluated for every identifier in a new ACME order, in addition to
+// the X.509 name policy configured in the provisioner options.
+type ACMEPolicy struct {
+	// AllowedIdentifierTypes restricts the identifier types that can be
+	// used in orders, e.g. "dns" or "ip". If empty, all identifier types
+	// are allowed.
+	AllowedIdentifierTypes []ACMEIdentifierType `json:"allowedIdentifierTypes,omitempty"`
+	// AllowWildcardNames indicates whether wildcard DNS identifiers (e.g.
+	// "*.example.com") are allowed. Defaults to true.
+	AllowWildcardNames *bool `json:"allowWildcardNames,omitempty"`
+}
+
+// Validate returns an error if the ACME policy is invalid.
+func (m *ACMEPolicy) Validate() error {
+	if m == nil {
+		return nil
+	}
+	for _, t := range m.AllowedIdentifierTypes {
+		switch t {
+		case DNS, IP, WireUser, WireDevice:
+		default:
+			return fmt.Errorf("acme policy allowedIdentifierTypes %q is not supported", t)
+		}
+	}
+	return nil
+}
+
+// isIdentifierTypeAllowed returns whether the identifier type is allowed by
+// the policy.
+func (m *ACMEPolicy) isIdentifierTypeAllowed(typ ACMEIdentifierType) bool {
+	if m == nil || len(m.AllowedIdentifierTypes) == 0 {
+		return true
+	}
+	for _, t := range m.AllowedIdentifierTypes {
+		if t == typ {
+			return true
+		}
+	}
+	return false
+}
+
+// isWildcardAllowed returns whether wildcard DNS names are allowed by the
+// policy.
+func (m *ACMEPolicy) isWildcardAllowed() bool {
+	return m == nil || m.AllowWildcardNames == nil || *m.AllowWildcardNames
+}
+
 // AuthorizeOrderIdentifier verifies the provisioner is allowed to issue a
 // certificate for an ACME Order Identifier.
 func (p *ACME) AuthorizeOrderIdentifier(_ context.Context, identifier ACMEIdentifier) error {
+	// evaluate the ACME specific provisioner policy first
+	if !p.Policy.isIdentifierTypeAllowed(identifier.Type) {
+		return fmt.Errorf("acme identifier type %q is not allowed by provisioner %q policy", identifier.Type, p.Name)
+	}
+	if identifier.Type == DNS && strings.HasPrefix(identifier.Value, "*.") && !p.Policy.isWildcardAllowed() {
+		return fmt.Errorf("wildcard names are not allowed by provisioner %q policy", p.Name)
+	}
+
 	x509Policy := p.ctl.getPolicy().getX509()
 
 	// identifier is allowed if no policy is configured

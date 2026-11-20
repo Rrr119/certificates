@@ -29,6 +29,7 @@ type Controller struct {
 	AuthorizeRenewFunc    AuthorizeRenewFunc
 	AuthorizeSSHRenewFunc AuthorizeSSHRenewFunc
 	policy                *policyEngine
+	quota                 *quotaTracker
 	httpClient            HTTPClient
 	webhookClient         HTTPClient
 	webhooks              []*Webhook
@@ -56,6 +57,16 @@ func NewController(p Interface, claims *Claims, config Config, options *Options)
 		}
 	}
 
+	var quota *quotaTracker
+	if qp, ok := p.(quotaProvider); ok {
+		if err := qp.GetQuota().Validate(); err != nil {
+			return nil, err
+		}
+		if q := qp.GetQuota(); q != nil && q.MaxActive > 0 {
+			quota = newQuotaTracker(q.MaxActive)
+		}
+	}
+
 	return &Controller{
 		Interface:             p,
 		Audiences:             &config.Audiences,
@@ -64,6 +75,7 @@ func NewController(p Interface, claims *Claims, config Config, options *Options)
 		AuthorizeRenewFunc:    config.AuthorizeRenewFunc,
 		AuthorizeSSHRenewFunc: config.AuthorizeSSHRenewFunc,
 		policy:                policy,
+		quota:                 quota,
 		webhookClient:         config.WebhookClient,
 		webhooks:              options.GetWebhooks(),
 		httpClient:            config.HTTPClient,
@@ -82,6 +94,33 @@ func (c *Controller) GetHTTPClient() HTTPClient {
 	return &http.Client{
 		Timeout: 10 * time.Second,
 	}
+}
+
+// AcquireQuota reserves a slot in the provisioner's issuance quota. It
+// returns a nil reservation and no error when no quota is configured.
+func (c *Controller) AcquireQuota(_ context.Context) (*QuotaReservation, error) {
+	if c.quota == nil {
+		return nil, nil
+	}
+	return c.quota.acquire(time.Now())
+}
+
+// ReleaseQuota frees the quota slot held by the certificate with the given
+// (decimal) serial number.
+func (c *Controller) ReleaseQuota(serialNumber string) {
+	if c.quota != nil {
+		c.quota.release(serialNumber)
+	}
+}
+
+// ActiveQuotaCount returns the number of quota slots currently in use,
+// including slots reserved for in-flight sign operations. It returns 0 when
+// no quota is configured.
+func (c *Controller) ActiveQuotaCount() int {
+	if c.quota == nil {
+		return 0
+	}
+	return c.quota.count()
 }
 
 // GetIdentity returns the identity for a given email.

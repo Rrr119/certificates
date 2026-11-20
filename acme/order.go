@@ -306,6 +306,12 @@ func (o *Order) Finalize(ctx context.Context, db DB, csr *x509.CertificateReques
 		NotAfter:  provisioner.NewTimeDuration(o.NotAfter),
 	}, signOps...)
 	if err != nil {
+		// Return a rateLimited error if the provisioner issuance quota
+		// was exceeded.
+		if errors.Is(err, provisioner.ErrQuotaExceeded) {
+			return NewError(ErrorRateLimitedType, "provisioner %q issuance quota exceeded", p.GetID())
+		}
+
 		// Add subproblem for webhook errors, others can be added later.
 		if webhookErr, ok := errors.AsType[*webhook.Error](err); ok {
 			acmeError := NewDetailedError(ErrorUnauthorizedType, "%s", webhookErr.Error())

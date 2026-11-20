@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid29545",
+  "B": "/home/dev/feedback/uid29545",
+  "sha": "93bc063113eef098b1a206db4d870954bee252ff",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "smallstep",
+    "repo": "certificates",
+    "sha": "93bc063113eef098b1a206db4d870954bee252ff"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "certificates",
+    "cloneUrl": "https://github.com/Rrr119/certificates.git"
+  },
+  "at": "2026-11-20T05:12:41.205Z"
+}

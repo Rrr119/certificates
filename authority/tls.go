@@ -296,6 +296,20 @@ func (a *Authority) signX509(ctx context.Context, csr *x509.CertificateRequest, 
 		)
 	}
 
+	// Acquire a quota slot if the provisioner enforces an issuance quota.
+	// The reservation is committed once the certificate has been signed and
+	// stored, and rolled back otherwise.
+	var quotaReservation *provisioner.QuotaReservation
+	if ql, ok := prov.(provisioner.QuotaLimiter); ok {
+		quotaReservation, err = ql.AcquireQuota(ctx)
+		if err != nil {
+			return nil, prov, errs.ApplyOptions(
+				errs.NewError(http.StatusTooManyRequests, err, "authority.Sign; %s", err.Error()),
+				opts...,
+			)
+		}
+	}
+
 	// Sign certificate
 	lifetime := leaf.NotAfter.Sub(leaf.NotBefore.Add(signOpts.Backdate))
 
@@ -307,6 +321,9 @@ func (a *Authority) signX509(ctx context.Context, csr *x509.CertificateRequest, 
 		Provisioner: pInfo,
 	})
 	if err != nil {
+		if quotaReservation != nil {
+			quotaReservation.Rollback()
+		}
 		return nil, prov, errs.Wrap(http.StatusInternalServerError, err, "authority.Sign; error creating certificate", opts...)
 	}
 
@@ -319,7 +336,14 @@ func (a *Authority) signX509(ctx context.Context, csr *x509.CertificateRequest, 
 
 	// Store certificate in the db.
 	if err := a.storeCertificate(prov, chain); err != nil && !errors.Is(err, db.ErrNotImplemented) {
+		if quotaReservation != nil {
+			quotaReservation.Rollback()
+		}
 		return nil, prov, errs.Wrap(http.StatusInternalServerError, err, "authority.Sign; error storing certificate in db", opts...)
+	}
+
+	if quotaReservation != nil {
+		quotaReservation.Commit(resp.Certificate.SerialNumber.String(), resp.Certificate.NotAfter)
 	}
 
 	return chain, prov, nil
@@ -698,6 +722,16 @@ func (a *Authority) Revoke(ctx context.Context, revokeOpts *RevokeOptions) error
 		// Save as revoked in the Db.
 		if err := a.revoke(revokedCert, rci); err != nil {
 			return failRevoke(err)
+		}
+
+		// Release the provisioner quota slot held by the revoked
+		// certificate, if the provisioner enforces an issuance quota.
+		if rci.ProvisionerID != "" {
+			if p, ok := a.provisioners.Load(rci.ProvisionerID); ok {
+				if ql, ok := p.(provisioner.QuotaLimiter); ok {
+					ql.ReleaseQuota(rci.Serial)
+				}
+			}
 		}
 
 		// Generate a new CRL so CRL requesters will always get an up-to-date
